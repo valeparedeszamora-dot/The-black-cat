@@ -219,14 +219,96 @@ const state = {
   imagenEditando: '',
 };
 
-// ── Supabase ──
-const SUPABASE_URL = 'https://ulsimleeftbtakovwuqo.supabase.co';
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVsc2ltbGVlZnRidGFrb3Z3dXFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxMTM5NTAsImV4cCI6MjEwNDY4OTk1MH0.PQCkmKbZW7Sl0K56MJ4JL_dMRcVBpZBsNccH4lehWAY';
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-
 const STORAGE_KEY = 'inventario-productos';
 const CONFIG_KEY = 'inventario-config';
 
+// ── Supabase ──
+const SUPABASE_URL = 'https://ulsimleeftbtakovwuqo.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVsc2ltbGVlZnRidGFrb3Z3dXFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxMTM5NTAsImV4cCI6MjEwNDY4OTk1MH0.PQCkmKbZW7Sl0K56MJ4JL_dMRcVBpZBsNccH4lehWAY';
+let sb;
+let usandoSupabase = false;
+try { sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY); } catch(e){ sb = null; }
+
+// Timeout helper — si Supabase tarda más de 6 segundos, cancela
+function conTimeout(promesa, ms = 6000){
+  return Promise.race([
+    promesa,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
+  ]);
+}
+
+async function sbGet(clave){
+  if(!sb) return null;
+  const { data, error } = await conTimeout(
+    sb.from('inventario').select('valor').eq('clave', clave).maybeSingle()
+  );
+  if(error){ console.error('sbGet error:', error); return null; }
+  return data ? data.valor : null;
+}
+
+async function sbSet(clave, valor){
+  if(!sb) return false;
+  const { error } = await conTimeout(
+    sb.from('inventario').upsert({ clave, valor }, { onConflict: 'clave' })
+  );
+  if(error){ console.error('sbSet error:', error); return false; }
+  return true;
+}
+
+// Lee: intenta Supabase, si falla usa localStorage
+async function cargarDatos(){
+  let productos = null;
+  let config = null;
+
+  // Intentar Supabase
+  try{
+    const raw = await sbGet(STORAGE_KEY);
+    if(raw){ productos = JSON.parse(raw); usandoSupabase = true; }
+    const rawCfg = await sbGet(CONFIG_KEY);
+    if(rawCfg) config = JSON.parse(rawCfg);
+  }catch(e){ console.warn('Supabase no disponible, usando datos locales:', e.message); }
+
+  // Fallback a localStorage si Supabase no devolvió nada
+  if(!productos){
+    try{
+      const local = localStorage.getItem(STORAGE_KEY);
+      if(local) productos = JSON.parse(local);
+    }catch(e){}
+  }
+  if(!config){
+    try{
+      const localCfg = localStorage.getItem(CONFIG_KEY);
+      if(localCfg) config = JSON.parse(localCfg);
+    }catch(e){}
+  }
+
+  state.productos = (productos || []).map(migrarProducto);
+  state.config = config || { password: null };
+  state.costoVisible = !state.config.password;
+  state.loaded = true;
+  render();
+}
+
+// Guarda: siempre en localStorage + intenta Supabase
+async function guardarDatos(){
+  const json = JSON.stringify(state.productos);
+  try{ localStorage.setItem(STORAGE_KEY, json); }catch(e){}
+  try{
+    const ok = await sbSet(STORAGE_KEY, json);
+    if(!ok) console.warn('No se guardó en Supabase, pero sí localmente');
+    return ok;
+  }catch(e){ console.warn('Error Supabase al guardar:', e.message); return false; }
+}
+
+async function guardarConfig(){
+  const json = JSON.stringify(state.config);
+  try{ localStorage.setItem(CONFIG_KEY, json); }catch(e){}
+  try{
+    return await sbSet(CONFIG_KEY, json);
+  }catch(e){ console.warn('Error Supabase config:', e.message); return false; }
+}
+
+/* Navegación tipo libro */
 function fmt(n){
   const v = Number(n)||0;
   return v.toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -240,48 +322,6 @@ function migrarProducto(p){
   return p;
 }
 function vendidosDe(p){ return (p.ventas||[]).reduce((s,v)=>s+v.cantidad,0); }
-
-// Helpers para leer/escribir en Supabase (tabla "inventario": clave TEXT PK, valor TEXT)
-async function sbGet(clave){
-  const { data, error } = await sb.from('inventario').select('valor').eq('clave', clave).maybeSingle();
-  if(error){ console.error('sbGet', error); return null; }
-  return data ? data.valor : null;
-}
-async function sbSet(clave, valor){
-  const { error } = await sb.from('inventario').upsert({ clave, valor }, { onConflict: 'clave' });
-  if(error){ console.error('sbSet', error); return false; }
-  return true;
-}
-
-async function cargarDatos(){
-  let productos = null;
-  try{
-    const raw = await sbGet(STORAGE_KEY);
-    if(raw) productos = JSON.parse(raw);
-  }catch(e){ console.error('cargarDatos', e); }
-  state.productos = (productos || []).map(migrarProducto);
-
-  let config = null;
-  try{
-    const rawCfg = await sbGet(CONFIG_KEY);
-    if(rawCfg) config = JSON.parse(rawCfg);
-  }catch(e){}
-  state.config = config || { password: null };
-  state.costoVisible = !state.config.password;
-  state.loaded = true;
-  render();
-}
-
-async function guardarDatos(){
-  try{
-    return await sbSet(STORAGE_KEY, JSON.stringify(state.productos));
-  }catch(e){ console.error('No se pudo guardar', e); return false; }
-}
-async function guardarConfig(){
-  try{
-    return await sbSet(CONFIG_KEY, JSON.stringify(state.config));
-  }catch(e){ console.error('No se pudo guardar la configuración', e); return false; }
-}
 
 /* Navegación tipo libro */
 function irAPortada(){ state.pagina = 0; render(); }
