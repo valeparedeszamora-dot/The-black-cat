@@ -210,7 +210,6 @@
 
   .loading{text-align:center;padding:60px;color:var(--ink-soft);}
 </style>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 </head>
 <body>
 <div class="app" id="app">
@@ -234,11 +233,27 @@ const state = {
 const STORAGE_KEY = 'inventario-productos';
 const CONFIG_KEY = 'inventario-config';
 
-// ── Supabase ──
-const SUPABASE_URL = 'https://ulsimleeftbtakovwuqo.supabase.co';
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVsc2ltbGVlZnRidGFrb3Z3dXFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxMTM5NTAsImV4cCI6MjEwNDY4OTk1MH0.PQCkmKbZW7Sl0K56MJ4JL_dMRcVBpZBsNccH4lehWAY';
-let sb;
-try { sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY); } catch(e){ sb = null; }
+// ── Supabase REST API (sin librería, mucho más rápido) ──
+const SB_URL = 'https://ulsimleeftbtakovwuqo.supabase.co/rest/v1';
+const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVsc2ltbGVlZnRidGFrb3Z3dXFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxMTM5NTAsImV4cCI6MjEwNDY4OTk1MH0.PQCkmKbZW7Sl0K56MJ4JL_dMRcVBpZBsNccH4lehWAY';
+const SB_HEADERS = {
+  'apikey': SB_KEY,
+  'Authorization': 'Bearer ' + SB_KEY,
+  'Content-Type': 'application/json',
+  'Prefer': 'return=minimal'
+};
+
+async function sbFetch(tabla, params = '', opts = {}){
+  const url = SB_URL + '/' + tabla + (params ? '?' + params : '');
+  const res = await fetch(url, {
+    headers: { ...SB_HEADERS, ...(opts.headers || {}) },
+    method: opts.method || 'GET',
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+  if(!res.ok) throw new Error(res.status + ' ' + res.statusText);
+  if(opts.method === 'DELETE' || opts.method === 'PATCH' || opts.method === 'POST') return true;
+  return res.json();
+}
 
 function fmt(n){
   const v = Number(n)||0;
@@ -247,79 +262,33 @@ function fmt(n){
 function uid(){ return 'p'+Date.now()+Math.random().toString(36).slice(2,7); }
 function vendidosDe(p){ return (p.ventas||[]).reduce((s,v)=>s+v.cantidad,0); }
 
-// ── Migración automática: mueve datos de la tabla vieja "inventario" a las nuevas tablas ──
-async function migrarDatosViejos(){
-  try{
-    const { data } = await sb.from('inventario').select('valor').eq('clave', STORAGE_KEY).maybeSingle();
-    if(!data || !data.valor) return;
-    const viejos = JSON.parse(data.valor);
-    if(!viejos.length) return;
-    // Verificar si ya hay productos en la tabla nueva
-    const { count } = await sb.from('productos').select('id', { count: 'exact', head: true });
-    if(count > 0) return; // Ya se migró antes
-
-    for(const p of viejos){
-      const ventas = p.ventas || [];
-      if(p.vendidos && p.vendidos > 0 && ventas.length === 0){
-        ventas.push({ id: 'legacy-'+p.id, cantidad: p.vendidos, fecha: null });
-      }
-      await sb.from('productos').upsert({
-        id: p.id,
-        nombre: p.nombre || '',
-        imagen: p.imagen || '',
-        costo: p.costoInicial || 0,
-        precio_venta: p.costoFinal || 0,
-        cantidad: p.cantidadInicial || 0
-      });
-      for(const v of ventas){
-        await sb.from('ventas').upsert({
-          id: v.id,
-          producto_id: p.id,
-          cantidad: v.cantidad,
-          fecha: v.fecha || new Date().toISOString()
-        });
-      }
-    }
-    console.log('Migración completada:', viejos.length, 'productos');
-  }catch(e){ console.warn('Error en migración:', e.message); }
-}
-
-// ── Cargar datos desde tablas organizadas ──
+// ── Cargar datos (SIN imágenes para que sea rápido) ──
 async function cargarDatos(){
   try{
-    // Primero intentar migrar datos viejos
-    await migrarDatosViejos();
+    // Cargar productos SIN la columna imagen (es lo pesado)
+    const prods = await sbFetch('productos', 'select=id,nombre,costo,precio_venta,cantidad,created_at&order=created_at');
+    const vtas = await sbFetch('ventas', 'select=id,producto_id,cantidad,fecha&order=fecha');
 
-    // Leer productos
-    const { data: prods, error: e1 } = await sb.from('productos').select('*').order('created_at');
-    if(e1) throw e1;
-
-    // Leer ventas
-    const { data: vtas, error: e2 } = await sb.from('ventas').select('*').order('fecha');
-    if(e2) throw e2;
-
-    // Armar la estructura que el render espera
     state.productos = (prods || []).map(p => ({
       id: p.id,
       nombre: p.nombre,
-      imagen: p.imagen || '',
+      imagen: null, // Se carga después al ver el producto
+      _imagenCargada: false,
       costoInicial: Number(p.costo) || 0,
       costoFinal: Number(p.precio_venta) || 0,
       cantidadInicial: p.cantidad || 0,
       ventas: (vtas || []).filter(v => v.producto_id === p.id).map(v => ({
-        id: v.id,
-        cantidad: v.cantidad,
-        fecha: v.fecha
+        id: v.id, cantidad: v.cantidad, fecha: v.fecha
       }))
     }));
 
-    // Config (password) — la dejamos en la tabla inventario
+    // Config
     try{
-      const { data: cfg } = await sb.from('inventario').select('valor').eq('clave', CONFIG_KEY).maybeSingle();
-      if(cfg) state.config = JSON.parse(cfg.valor);
+      const cfgArr = await sbFetch('inventario', 'select=valor&clave=eq.' + CONFIG_KEY);
+      if(cfgArr && cfgArr[0]) state.config = JSON.parse(cfgArr[0].valor);
     }catch(e){}
   }catch(e){
-    console.error('Error cargando datos:', e.message);
+    console.error('Error cargando:', e.message);
     state.productos = [];
   }
   state.costoVisible = !state.config.password;
@@ -327,58 +296,73 @@ async function cargarDatos(){
   render();
 }
 
-// ── Guardar/actualizar un producto ──
+// ── Cargar imagen de UN producto cuando se necesite ──
+async function cargarImagen(productoId){
+  const p = state.productos.find(x => x.id === productoId);
+  if(!p || p._imagenCargada) return;
+  try{
+    const arr = await sbFetch('productos', 'select=imagen&id=eq.' + productoId);
+    if(arr && arr[0]){ p.imagen = arr[0].imagen || ''; }
+  }catch(e){ p.imagen = ''; }
+  p._imagenCargada = true;
+  render();
+}
+
+// ── Guardar/actualizar producto ──
 async function guardarProductoEnDB(p){
-  const { error } = await sb.from('productos').upsert({
-    id: p.id,
-    nombre: p.nombre,
-    imagen: p.imagen || '',
-    costo: p.costoInicial,
-    precio_venta: p.costoFinal,
-    cantidad: p.cantidadInicial
-  });
-  if(error){ console.error('Error guardando producto:', error); return false; }
-  return true;
+  try{
+    await sbFetch('productos', 'id=eq.' + p.id, {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+      body: {
+        id: p.id, nombre: p.nombre, imagen: p.imagen || '',
+        costo: p.costoInicial, precio_venta: p.costoFinal, cantidad: p.cantidadInicial
+      }
+    });
+    return true;
+  }catch(e){ console.error('Error guardando:', e); return false; }
 }
 
 // ── Eliminar producto ──
 async function eliminarProductoEnDB(id){
-  const { error } = await sb.from('productos').delete().eq('id', id);
-  if(error){ console.error('Error eliminando:', error); return false; }
-  return true;
+  try{
+    await sbFetch('productos', 'id=eq.' + id, { method: 'DELETE' });
+    return true;
+  }catch(e){ console.error('Error eliminando:', e); return false; }
 }
 
 // ── Registrar venta ──
 async function registrarVentaEnDB(venta){
-  const { error } = await sb.from('ventas').insert({
-    id: venta.id,
-    producto_id: venta.producto_id,
-    cantidad: venta.cantidad,
-    fecha: venta.fecha
-  });
-  if(error){ console.error('Error en venta:', error); return false; }
-  return true;
+  try{
+    await sbFetch('ventas', '', {
+      method: 'POST',
+      body: { id: venta.id, producto_id: venta.producto_id, cantidad: venta.cantidad, fecha: venta.fecha }
+    });
+    return true;
+  }catch(e){ console.error('Error en venta:', e); return false; }
 }
 
 // ── Cancelar venta ──
 async function cancelarVentaEnDB(ventaId){
-  const { error } = await sb.from('ventas').delete().eq('id', ventaId);
-  if(error){ console.error('Error cancelando venta:', error); return false; }
-  return true;
+  try{
+    await sbFetch('ventas', 'id=eq.' + ventaId, { method: 'DELETE' });
+    return true;
+  }catch(e){ console.error('Error cancelando:', e); return false; }
 }
 
-// ── Guardar config ──
+// ── Config ──
 async function guardarConfig(){
   try{
-    await sb.from('inventario').upsert(
-      { clave: CONFIG_KEY, valor: JSON.stringify(state.config) },
-      { onConflict: 'clave' }
-    );
+    await sbFetch('inventario', 'clave=eq.' + CONFIG_KEY, {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+      body: { clave: CONFIG_KEY, valor: JSON.stringify(state.config) }
+    });
     return true;
   }catch(e){ return false; }
 }
 
-// Estas funciones ya no se usan pero las dejo para no romper nada
+// Compatibilidad
 async function guardarDatos(){ return true; }
 
 /* Buscador */
@@ -394,15 +378,38 @@ function buscarProducto(texto){
 
 /* Navegación tipo libro */
 function irAPortada(){ state.pagina = 0; render(); }
-function irAProducto(idx){ state.pagina = idx + 1; render(); }
-function paginaSiguiente(){ if(state.pagina < state.productos.length){ state.pagina++; render(); } }
-function paginaAnterior(){ if(state.pagina > 0){ state.pagina--; render(); } }
+function irAProducto(idx){
+  state.pagina = idx + 1;
+  render();
+  // Cargar imagen del producto si aún no se cargó
+  const p = state.productos[idx];
+  if(p && !p._imagenCargada) cargarImagen(p.id);
+}
+function paginaSiguiente(){
+  if(state.pagina < state.productos.length){
+    state.pagina++;
+    render();
+    const p = state.productos[state.pagina - 1];
+    if(p && !p._imagenCargada) cargarImagen(p.id);
+  }
+}
+function paginaAnterior(){
+  if(state.pagina > 0){
+    state.pagina--;
+    render();
+    if(state.pagina > 0){
+      const p = state.productos[state.pagina - 1];
+      if(p && !p._imagenCargada) cargarImagen(p.id);
+    }
+  }
+}
 
 /* Modales */
 function abrirNuevo(){ state.modal = 'nuevo'; state.editId = null; state.imagenEditando = ''; render(); }
-function abrirEditar(id){
-  state.modal = 'editar'; state.editId = id;
+async function abrirEditar(id){
   const p = state.productos.find(x=>x.id===id);
+  if(p && !p._imagenCargada) await cargarImagen(id);
+  state.modal = 'editar'; state.editId = id;
   state.imagenEditando = p ? (p.imagen || '') : '';
   render();
 }
@@ -690,7 +697,7 @@ function renderPaginaProducto(idx){
     </div>
 
     <p class="pagina-nombre">${escapeHtml(p.nombre)}</p>
-    <div class="thumb">${p.imagen ? `<img src="${escapeAttr(p.imagen)}" onerror="this.parentElement.innerHTML='📦'">` : '📦'}</div>
+    <div class="thumb">${!p._imagenCargada ? '<span style="font-size:14px;color:var(--ink-soft)">Cargando imagen…</span>' : (p.imagen ? `<img src="${escapeAttr(p.imagen)}" onerror="this.parentElement.innerHTML='📦'">` : '📦')}</div>
 
     <div class="precios">Costo <b>${maskCosto('S/ '+fmt(p.costoInicial))}</b> · Venta <b>S/ ${fmt(p.costoFinal)}</b> · Ganancia/u <b>${maskCosto('S/ '+fmt(gananciaUnit))}</b></div>
 
