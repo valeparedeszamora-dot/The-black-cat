@@ -226,102 +226,148 @@ const CONFIG_KEY = 'inventario-config';
 const SUPABASE_URL = 'https://ulsimleeftbtakovwuqo.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVsc2ltbGVlZnRidGFrb3Z3dXFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxMTM5NTAsImV4cCI6MjEwNDY4OTk1MH0.PQCkmKbZW7Sl0K56MJ4JL_dMRcVBpZBsNccH4lehWAY';
 let sb;
-let usandoSupabase = false;
 try { sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY); } catch(e){ sb = null; }
 
-// Timeout helper — si Supabase tarda más de 6 segundos, cancela
-function conTimeout(promesa, ms = 6000){
-  return Promise.race([
-    promesa,
-    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
-  ]);
-}
-
-async function sbGet(clave){
-  if(!sb) return null;
-  const { data, error } = await conTimeout(
-    sb.from('inventario').select('valor').eq('clave', clave).maybeSingle()
-  );
-  if(error){ console.error('sbGet error:', error); return null; }
-  return data ? data.valor : null;
-}
-
-async function sbSet(clave, valor){
-  if(!sb) return false;
-  const { error } = await conTimeout(
-    sb.from('inventario').upsert({ clave, valor }, { onConflict: 'clave' })
-  );
-  if(error){ console.error('sbSet error:', error); return false; }
-  return true;
-}
-
-// Lee: intenta Supabase, si falla usa localStorage
-async function cargarDatos(){
-  let productos = null;
-  let config = null;
-
-  // Intentar Supabase
-  try{
-    const raw = await sbGet(STORAGE_KEY);
-    if(raw){ productos = JSON.parse(raw); usandoSupabase = true; }
-    const rawCfg = await sbGet(CONFIG_KEY);
-    if(rawCfg) config = JSON.parse(rawCfg);
-  }catch(e){ console.warn('Supabase no disponible, usando datos locales:', e.message); }
-
-  // Fallback a localStorage si Supabase no devolvió nada
-  if(!productos){
-    try{
-      const local = localStorage.getItem(STORAGE_KEY);
-      if(local) productos = JSON.parse(local);
-    }catch(e){}
-  }
-  if(!config){
-    try{
-      const localCfg = localStorage.getItem(CONFIG_KEY);
-      if(localCfg) config = JSON.parse(localCfg);
-    }catch(e){}
-  }
-
-  state.productos = (productos || []).map(migrarProducto);
-  state.config = config || { password: null };
-  state.costoVisible = !state.config.password;
-  state.loaded = true;
-  render();
-}
-
-// Guarda: siempre en localStorage + intenta Supabase
-async function guardarDatos(){
-  const json = JSON.stringify(state.productos);
-  try{ localStorage.setItem(STORAGE_KEY, json); }catch(e){}
-  try{
-    const ok = await sbSet(STORAGE_KEY, json);
-    if(!ok) console.warn('No se guardó en Supabase, pero sí localmente');
-    return ok;
-  }catch(e){ console.warn('Error Supabase al guardar:', e.message); return false; }
-}
-
-async function guardarConfig(){
-  const json = JSON.stringify(state.config);
-  try{ localStorage.setItem(CONFIG_KEY, json); }catch(e){}
-  try{
-    return await sbSet(CONFIG_KEY, json);
-  }catch(e){ console.warn('Error Supabase config:', e.message); return false; }
-}
-
-/* Navegación tipo libro */
 function fmt(n){
   const v = Number(n)||0;
   return v.toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
 }
 function uid(){ return 'p'+Date.now()+Math.random().toString(36).slice(2,7); }
-
-function migrarProducto(p){
-  if(!p.ventas){
-    p.ventas = (p.vendidos && p.vendidos > 0) ? [{id:'legacy-'+p.id, cantidad:p.vendidos, fecha:null}] : [];
-  }
-  return p;
-}
 function vendidosDe(p){ return (p.ventas||[]).reduce((s,v)=>s+v.cantidad,0); }
+
+// ── Migración automática: mueve datos de la tabla vieja "inventario" a las nuevas tablas ──
+async function migrarDatosViejos(){
+  try{
+    const { data } = await sb.from('inventario').select('valor').eq('clave', STORAGE_KEY).maybeSingle();
+    if(!data || !data.valor) return;
+    const viejos = JSON.parse(data.valor);
+    if(!viejos.length) return;
+    // Verificar si ya hay productos en la tabla nueva
+    const { count } = await sb.from('productos').select('id', { count: 'exact', head: true });
+    if(count > 0) return; // Ya se migró antes
+
+    for(const p of viejos){
+      const ventas = p.ventas || [];
+      if(p.vendidos && p.vendidos > 0 && ventas.length === 0){
+        ventas.push({ id: 'legacy-'+p.id, cantidad: p.vendidos, fecha: null });
+      }
+      await sb.from('productos').upsert({
+        id: p.id,
+        nombre: p.nombre || '',
+        imagen: p.imagen || '',
+        costo: p.costoInicial || 0,
+        precio_venta: p.costoFinal || 0,
+        cantidad: p.cantidadInicial || 0
+      });
+      for(const v of ventas){
+        await sb.from('ventas').upsert({
+          id: v.id,
+          producto_id: p.id,
+          cantidad: v.cantidad,
+          fecha: v.fecha || new Date().toISOString()
+        });
+      }
+    }
+    console.log('Migración completada:', viejos.length, 'productos');
+  }catch(e){ console.warn('Error en migración:', e.message); }
+}
+
+// ── Cargar datos desde tablas organizadas ──
+async function cargarDatos(){
+  try{
+    // Primero intentar migrar datos viejos
+    await migrarDatosViejos();
+
+    // Leer productos
+    const { data: prods, error: e1 } = await sb.from('productos').select('*').order('created_at');
+    if(e1) throw e1;
+
+    // Leer ventas
+    const { data: vtas, error: e2 } = await sb.from('ventas').select('*').order('fecha');
+    if(e2) throw e2;
+
+    // Armar la estructura que el render espera
+    state.productos = (prods || []).map(p => ({
+      id: p.id,
+      nombre: p.nombre,
+      imagen: p.imagen || '',
+      costoInicial: Number(p.costo) || 0,
+      costoFinal: Number(p.precio_venta) || 0,
+      cantidadInicial: p.cantidad || 0,
+      ventas: (vtas || []).filter(v => v.producto_id === p.id).map(v => ({
+        id: v.id,
+        cantidad: v.cantidad,
+        fecha: v.fecha
+      }))
+    }));
+
+    // Config (password) — la dejamos en la tabla inventario
+    try{
+      const { data: cfg } = await sb.from('inventario').select('valor').eq('clave', CONFIG_KEY).maybeSingle();
+      if(cfg) state.config = JSON.parse(cfg.valor);
+    }catch(e){}
+  }catch(e){
+    console.error('Error cargando datos:', e.message);
+    state.productos = [];
+  }
+  state.costoVisible = !state.config.password;
+  state.loaded = true;
+  render();
+}
+
+// ── Guardar/actualizar un producto ──
+async function guardarProductoEnDB(p){
+  const { error } = await sb.from('productos').upsert({
+    id: p.id,
+    nombre: p.nombre,
+    imagen: p.imagen || '',
+    costo: p.costoInicial,
+    precio_venta: p.costoFinal,
+    cantidad: p.cantidadInicial
+  });
+  if(error){ console.error('Error guardando producto:', error); return false; }
+  return true;
+}
+
+// ── Eliminar producto ──
+async function eliminarProductoEnDB(id){
+  const { error } = await sb.from('productos').delete().eq('id', id);
+  if(error){ console.error('Error eliminando:', error); return false; }
+  return true;
+}
+
+// ── Registrar venta ──
+async function registrarVentaEnDB(venta){
+  const { error } = await sb.from('ventas').insert({
+    id: venta.id,
+    producto_id: venta.producto_id,
+    cantidad: venta.cantidad,
+    fecha: venta.fecha
+  });
+  if(error){ console.error('Error en venta:', error); return false; }
+  return true;
+}
+
+// ── Cancelar venta ──
+async function cancelarVentaEnDB(ventaId){
+  const { error } = await sb.from('ventas').delete().eq('id', ventaId);
+  if(error){ console.error('Error cancelando venta:', error); return false; }
+  return true;
+}
+
+// ── Guardar config ──
+async function guardarConfig(){
+  try{
+    await sb.from('inventario').upsert(
+      { clave: CONFIG_KEY, valor: JSON.stringify(state.config) },
+      { onConflict: 'clave' }
+    );
+    return true;
+  }catch(e){ return false; }
+}
+
+// Estas funciones ya no se usan pero las dejo para no romper nada
+async function guardarDatos(){ return true; }
 
 /* Navegación tipo libro */
 function irAPortada(){ state.pagina = 0; render(); }
@@ -435,27 +481,27 @@ async function guardarProducto(){
     return;
   }
 
-  const respaldo = JSON.parse(JSON.stringify(state.productos));
-
+  let producto;
   if(state.modal === 'editar' && state.editId){
-    const p = state.productos.find(x=>x.id===state.editId);
-    if(p){
-      p.nombre = nombre;
-      p.imagen = imagen;
-      p.costoInicial = costoInicial;
-      p.costoFinal = costoFinal;
-      p.cantidadInicial = cantidad;
+    producto = state.productos.find(x=>x.id===state.editId);
+    if(producto){
+      producto.nombre = nombre;
+      producto.imagen = imagen;
+      producto.costoInicial = costoInicial;
+      producto.costoFinal = costoFinal;
+      producto.cantidadInicial = cantidad;
     }
   } else {
-    state.productos.push({
+    producto = {
       id: uid(), nombre, imagen, costoInicial, costoFinal,
       cantidadInicial: cantidad, ventas: [],
-    });
+    };
+    state.productos.push(producto);
   }
 
-  const guardadoOk = await guardarDatos();
-  if(!guardadoOk){
-    state.productos = respaldo;
+  const ok = await guardarProductoEnDB(producto);
+  if(!ok){
+    if(state.modal !== 'editar') state.productos.pop();
     if(errBox) errBox.textContent = 'No se pudo guardar. Revisa tu conexión e inténtalo de nuevo.';
     return;
   }
@@ -464,14 +510,13 @@ async function guardarProducto(){
 
 async function eliminarProducto(id){
   if(!confirm('¿Eliminar este producto del inventario? Esta acción no se puede deshacer.')) return;
-  const respaldo = JSON.parse(JSON.stringify(state.productos));
+  const ok = await eliminarProductoEnDB(id);
+  if(!ok){
+    alert('No se pudo eliminar el producto. Revisa tu conexión e inténtalo de nuevo.');
+    return;
+  }
   state.productos = state.productos.filter(p=>p.id!==id);
   state.pagina = 0;
-  const ok = await guardarDatos();
-  if(!ok){
-    state.productos = respaldo;
-    alert('No se pudo eliminar el producto. Revisa tu conexión e inténtalo de nuevo.');
-  }
   render();
 }
 
@@ -482,14 +527,13 @@ async function confirmarVenta(){
   const restante = p.cantidadInicial - vendidosDe(p);
   const cant = Math.min(state.venderCantidad, restante);
   if(cant <= 0) return;
-  const respaldo = JSON.parse(JSON.stringify(state.productos));
-  p.ventas.push({ id: uid(), cantidad: cant, fecha: new Date().toISOString() });
-  const ok = await guardarDatos();
+  const venta = { id: uid(), producto_id: p.id, cantidad: cant, fecha: new Date().toISOString() };
+  const ok = await registrarVentaEnDB(venta);
   if(!ok){
-    state.productos = respaldo;
     alert('No se pudo registrar la venta. Revisa tu conexión e inténtalo de nuevo.');
     return;
   }
+  p.ventas.push({ id: venta.id, cantidad: cant, fecha: venta.fecha });
   cerrarModal();
 }
 function cambiarStepper(delta){
@@ -502,13 +546,12 @@ async function cancelarVenta(productoId, ventaId){
   const p = state.productos.find(x=>x.id===productoId);
   if(!p) return;
   if(!confirm('¿Cancelar esta venta? La cantidad vuelve a estar disponible en el inventario.')) return;
-  const respaldo = JSON.parse(JSON.stringify(state.productos));
-  p.ventas = p.ventas.filter(v=>v.id!==ventaId);
-  const ok = await guardarDatos();
+  const ok = await cancelarVentaEnDB(ventaId);
   if(!ok){
-    state.productos = respaldo;
     alert('No se pudo cancelar la venta. Revisa tu conexión e inténtalo de nuevo.');
+    return;
   }
+  p.ventas = p.ventas.filter(v=>v.id!==ventaId);
   render();
 }
 function fechaCorta(iso){
