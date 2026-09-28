@@ -104,6 +104,17 @@
   .add-btn:hover{background:#111c28;}
 
   /* Índice (portada) */
+  .buscador-wrap{position:relative;margin-bottom:16px;}
+  .buscador{
+    width:100%;padding:10px 14px 10px 36px;border:1px solid var(--border);border-radius:20px;
+    font-size:14px;font-family:'Inter',sans-serif;background:var(--paper-light);color:var(--ink);
+    outline:none;transition:border-color .15s;
+  }
+  .buscador:focus{border-color:var(--brass);}
+  .buscador-icon{position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:14px;color:var(--ink-soft);pointer-events:none;}
+  .buscador-clear{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--ink-soft);font-size:16px;cursor:pointer;padding:2px 6px;}
+  .buscador-clear:hover{color:var(--ink);}
+  .sin-resultados{text-align:center;padding:30px;color:var(--ink-soft);font-size:14px;}
   .indice-titulo{font-family:'Fraunces',serif;font-size:14px;color:var(--ink-soft);margin:0 0 8px;text-transform:uppercase;letter-spacing:.06em;}
   .indice{border-top:1px solid var(--border);}
   .indice-item{
@@ -210,13 +221,14 @@
 const state = {
   productos: [],
   loaded: false,
-  pagina: 0, // 0 = portada/índice, N = producto N-1
-  modal: null, // 'nuevo' | 'editar' | 'vender' | 'historial'
+  pagina: 0,
+  modal: null,
   editId: null,
   venderCantidad: 1,
   config: { password: null },
   costoVisible: true,
   imagenEditando: '',
+  busqueda: '',
 };
 
 const STORAGE_KEY = 'inventario-productos';
@@ -368,6 +380,17 @@ async function guardarConfig(){
 
 // Estas funciones ya no se usan pero las dejo para no romper nada
 async function guardarDatos(){ return true; }
+
+/* Buscador */
+function buscarProducto(texto){
+  state.busqueda = texto;
+  render();
+  // Re-enfocar el input después del render
+  setTimeout(()=>{
+    const input = document.querySelector('.buscador');
+    if(input){ input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+  }, 0);
+}
 
 /* Navegación tipo libro */
 function irAPortada(){ state.pagina = 0; render(); }
@@ -617,18 +640,35 @@ function renderPortada(){
   if(state.productos.length === 0){
     html += `<div class="vacio"><p>Tu inventario está vacío</p>Agrega tu primer producto para empezar a llevar el control.</div>`;
   } else {
-    html += '<p class="indice-titulo">Índice — toca un producto para ver su página</p><div class="indice">';
-    state.productos.forEach((p, idx)=>{
-      const restante = p.cantidadInicial - vendidosDe(p);
-      html += `
-        <button class="indice-item" onclick="irAProducto(${idx})">
-          <span class="indice-num">${idx+1}.</span>
-          <span class="indice-nombre">${escapeHtml(p.nombre)}</span>
-          <span class="indice-stock">${restante <= 0 ? 'Agotado' : restante + ' disp.'}</span>
-        </button>
-      `;
-    });
-    html += '</div>';
+    html += `
+      <div class="buscador-wrap">
+        <span class="buscador-icon">🔍</span>
+        <input class="buscador" type="text" placeholder="Buscar producto..." value="${escapeAttr(state.busqueda)}" oninput="buscarProducto(this.value)">
+        ${state.busqueda ? '<button class="buscador-clear" onclick="buscarProducto(\'\')">✕</button>' : ''}
+      </div>
+    `;
+
+    const termino = state.busqueda.toLowerCase();
+    const filtrados = state.productos.map((p, idx) => ({ p, idx })).filter(({ p }) =>
+      !termino || p.nombre.toLowerCase().includes(termino)
+    );
+
+    if(filtrados.length === 0){
+      html += '<div class="sin-resultados">No se encontraron productos con "' + escapeHtml(state.busqueda) + '"</div>';
+    } else {
+      html += '<p class="indice-titulo">Índice — toca un producto para ver su página</p><div class="indice">';
+      filtrados.forEach(({ p, idx })=>{
+        const restante = p.cantidadInicial - vendidosDe(p);
+        html += `
+          <button class="indice-item" onclick="irAProducto(${idx})">
+            <span class="indice-num">${idx+1}.</span>
+            <span class="indice-nombre">${escapeHtml(p.nombre)}</span>
+            <span class="indice-stock">${restante <= 0 ? 'Agotado' : restante + ' disp.'}</span>
+          </button>
+        `;
+      });
+      html += '</div>';
+    }
   }
   return html;
 }
